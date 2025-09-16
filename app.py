@@ -401,7 +401,7 @@ def force_settle(room: GameRoom):
 def cmd_help(event):
     reply_text(event,
         "📜 指令列表（中文）\n"
-        "・建房／加入／狀態／角色清單／重置\n"
+        "・建房／加入／暱稱 你的名字／狀態／角色清單／重置\n"
         "・開始 → 產生預設模板 → 房主可『換 女巫 / 換 獵人』 → 『確認角色』發牌\n"
         "・夜晚（請私訊機器人）：\n"
         "   狼人：擊殺 名字\n"
@@ -436,15 +436,35 @@ def cmd_join(event):
     if room.started:
         reply_text(event, "遊戲已開始，無法加入。")
         return
-    uid, name = get_user_id(event), get_display_name(rid, get_user_id(event))
+    uid, default_name = get_user_id(event), get_display_name(rid, get_user_id(event))
     if uid in room.players:
-        reply_text(event, f"{name} 已在房內。")
+        reply_text(event, f"{room.players[uid].name} 已在房內。")
         return
     if len(room.players) >= MAX_P:
         reply_text(event, f"人數已滿（{MAX_P}）。")
         return
-    room.players[uid] = Player(uid, name)
-    reply_text(event, f"🙋 {name} 加入！目前人數：{len(room.players)}")
+    # 預設用 LINE 顯示名稱加入；玩家可再輸入「暱稱 你的名字」變更
+    room.players[uid] = Player(uid, default_name)
+    reply_text(event, f"🙋 {default_name} 加入！目前人數：{len(room.players)}\n（若要更改暱稱，請輸入：暱稱 你的名字）")
+
+def cmd_set_nickname(event, nickname: str):
+    """設定玩家暱稱：加入後即可於群/私訊輸入『暱稱 XXX』變更名稱。"""
+    rid = get_room_id(event)
+    room = ROOMS.get(rid)
+    if not room:
+        reply_text(event, "尚未建房或房已結束。")
+        return
+    uid = get_user_id(event)
+    if uid not in room.players:
+        reply_text(event, "你尚未加入本局，請先輸入「加入」。")
+        return
+    nickname = nickname.strip()
+    if not nickname:
+        reply_text(event, "用法：暱稱 你的名字（不可為空）")
+        return
+    room.players[uid].name = nickname
+    # 依你的要求：回覆「使用者名稱：暱稱」
+    reply_text(event, f"使用者名稱：{nickname}")
 
 def cmd_start(event):
     rid, uid = get_room_id(event), get_user_id(event)
@@ -887,7 +907,15 @@ if LINE_READY:
         if text == "幫助": cmd_help(event); return
         if text == "角色清單": cmd_rolelist(event); return
         if text == "建房": cmd_build(event); return
+
+        # 加入 & 暱稱
         if text == "加入": cmd_join(event); return
+        if text.startswith("暱稱"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 2 and parts[1].strip():
+                cmd_set_nickname(event, parts[1].strip()); return
+            reply_text(event, "用法：暱稱 你的名字"); return
+
         if text == "狀態": cmd_status(event); return
         if text == "重置": cmd_reset(event); return
 
