@@ -458,13 +458,20 @@ def cmd_set_nickname(event, nickname: str):
     if uid not in room.players:
         reply_text(event, "你尚未加入本局，請先輸入「加入」。")
         return
+
     nickname = nickname.strip()
     if not nickname:
         reply_text(event, "用法：暱稱 你的名字（不可為空）")
         return
+
+    # 取得該使用者目前的 LINE 顯示名稱（原名）
+    line_name = get_display_name(rid, uid)
+
+    # 更新玩家暱稱
     room.players[uid].name = nickname
-    # 依你的要求：回覆「使用者名稱：暱稱」
-    reply_text(event, f"使用者名稱：{nickname}")
+
+    # 依你的需求：回覆「原本LINE名稱：變動後的暱稱」
+    reply_text(event, f"{line_name}：{nickname}")
 
 def cmd_start(event):
     rid, uid = get_room_id(event), get_user_id(event)
@@ -955,3 +962,4 @@ if LINE_READY:
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
+
