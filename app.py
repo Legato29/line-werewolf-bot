@@ -1,60 +1,113 @@
 # -*- coding: utf-8 -*-
-import os, random
+import os, random, threading
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, abort
-from dotenv import load_dotenv
 
-# ===== line-bot-sdk v3 =====
-from linebot.v3.webhook import WebhookHandler
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
-from linebot.v3.messaging import (
-    MessagingApi, Configuration, ApiClient,
-    ReplyMessageRequest, PushMessageRequest, TextMessage
-)
-from linebot.v3.exceptions import InvalidSignatureError
+# ===== 可選：載入 Render Secret Files 的 .env =====
+SECRET_FILE_PATH = "/etc/secrets/.env"  # 若未使用可忽略；如有不同路徑請修改
+try:
+    if os.path.exists(SECRET_FILE_PATH):
+        from dotenv import load_dotenv
+        load_dotenv(SECRET_FILE_PATH)
+    else:
+        # 環境變數若已在 Render → Environment 設定，這段可省略
+        from dotenv import load_dotenv
+        load_dotenv()
+except Exception:
+    pass  # 不因 dotenv 失敗而終止
 
-# ===== Scheduler =====
-from apscheduler.schedulers.background import BackgroundScheduler
+# ===== LINE v3 SDK（啟動期不讓它造成崩潰）=====
+LINE_READY = True
+try:
+    from linebot.v3.webhook import WebhookHandler
+    from linebot.v3.webhooks import MessageEvent, TextMessageContent
+    from linebot.v3.messaging import (
+        MessagingApi, Configuration, ApiClient,
+        ReplyMessageRequest, PushMessageRequest, TextMessage
+    )
+    from linebot.v3.exceptions import InvalidSignatureError
+except Exception as e:
+    LINE_READY = False
+    # 後續會記 log，但不終止 app
+    print(f"[BOOT] line-bot-sdk v3 未就緒：{e}")
 
-# ================== 基本設定 ==================
-load_dotenv()
 CHANNEL_SECRET = os.getenv("CHANNEL_SECRET")
 CHANNEL_ACCESS_TOKEN = os.getenv("CHANNEL_ACCESS_TOKEN")
-NIGHT_MINUTES = int(os.getenv("NIGHT_MINUTES", "6"))
-DAY_MINUTES = int(os.getenv("DAY_MINUTES", "8"))
 
-if not CHANNEL_SECRET or not CHANNEL_ACCESS_TOKEN:
-    raise SystemExit("請先在 .env 設定 CHANNEL_SECRET / CHANNEL_ACCESS_TOKEN")
+# ===== APScheduler 可選；無則改用 threading.Timer =====
+USE_APS = True
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except Exception as e:
+    USE_APS = False
+    print(f"[BOOT] apscheduler 未安裝，將使用簡易排程器：{e}")
 
+# ============== Flask App ==============
 app = Flask(__name__)
-handler = WebhookHandler(CHANNEL_SECRET)
-configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
 
-scheduler = BackgroundScheduler()
-scheduler.start()
+def make_api_client():
+    """沒有 token 就回 None，避免在回覆時拋錯。"""
+    if not (LINE_READY and CHANNEL_ACCESS_TOKEN):
+        return None
+    cfg = Configuration(access_token=CHANNEL_ACCESS_TOKEN)
+    return ApiClient(cfg)
 
-@app.route("/")
-def home():
-    return "Line Werewolf Bot 正在運行！"
+handler = WebhookHandler(CHANNEL_SECRET or "DUMMY_SECRET") if LINE_READY else None
 
-def with_api():
-    return ApiClient(configuration)
+@app.route("/", methods=["GET"])
+def index():
+    return "Werewolf LINE Bot is running. POST /callback for webhook.", 200
 
+@app.route("/callback", methods=["POST"])
+def callback():
+    if not LINE_READY:
+        # 讓 LINE Verify 也能回 200，不讓部署失敗；logs 會有警告
+        app.logger.warning("[CALLBACK] 收到 webhook，但 LINE SDK 未就緒（未安裝或 import 失敗）。")
+        return "LINE SDK not ready", 200
+
+    sig = request.headers.get("X-Line-Signature", "")
+    body = request.get_data(as_text=True)
+    try:
+        handler.handle(body, sig)
+    except InvalidSignatureError:
+        # SECRET 錯或非 LINE 來源
+        app.logger.warning("[CALLBACK] InvalidSignatureError（多半是 SECRET 錯或非 LINE 來源）")
+        abort(400)
+    except Exception as e:
+        app.logger.exception(f"[CALLBACK] 例外：{e}")
+        return "error logged", 200
+    return "OK", 200
+
+# ====== 安全回覆工具 ======
 def reply_text(event, text: str):
-    with with_api() as api_client:
-        MessagingApi(api_client).reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=text)]
+    client = make_api_client()
+    if not client:
+        app.logger.warning("[REPLY] 缺少 CHANNEL_ACCESS_TOKEN 或 LINE SDK 未就緒，無法回覆")
+        return
+    try:
+        with client as api_client:
+            MessagingApi(api_client).reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=[TextMessage(text=text)]
+                )
             )
-        )
+    except Exception as e:
+        app.logger.exception(f"[REPLY] 回覆失敗：{e}")
 
 def push_text(to_id: str, text: str):
-    with with_api() as api_client:
-        MessagingApi(api_client).push_message(
-            PushMessageRequest(to=to_id, messages=[TextMessage(text=text)])
-        )
+    client = make_api_client()
+    if not client:
+        app.logger.warning("[PUSH] 缺少 CHANNEL_ACCESS_TOKEN 或 LINE SDK 未就緒，無法推送")
+        return
+    try:
+        with client as api_client:
+            MessagingApi(api_client).push_message(
+                PushMessageRequest(to=to_id, messages=[TextMessage(text=text)])
+            )
+    except Exception as e:
+        app.logger.exception(f"[PUSH] 推送失敗：{e}")
 
 def get_room_id(event):
     s = event.source
@@ -65,7 +118,10 @@ def get_user_id(event):
 
 def get_display_name(room_id: str | None, user_id: str) -> str:
     try:
-        with with_api() as api_client:
+        client = make_api_client()
+        if not client:
+            return "玩家"
+        with client as api_client:
             api = MessagingApi(api_client)
             if room_id and room_id != user_id:
                 prof = api.get_group_member_profile(room_id, user_id)
@@ -78,17 +134,19 @@ def get_display_name(room_id: str | None, user_id: str) -> str:
 def now_utc():
     return datetime.now(timezone.utc)
 
-# ================== 規則與資料 ==================
+# ============== 遊戲資料與規則 ==============
 MIN_P, MAX_P = 5, 8
 WOLF_COUNT_BY_N = {5: 1, 6: 2, 7: 2, 8: 2}
+NIGHT_MINUTES = int(os.getenv("NIGHT_MINUTES", "6"))
+DAY_MINUTES = int(os.getenv("DAY_MINUTES", "8"))
 
 ROLE_DESCRIPTIONS = {
-    "狼人": "夜晚可商議並擊殺一名玩家（『私訊』：擊殺 名字）。",
-    "村民": "無主動技能，靠發言與投票。",
-    "預言家": "夜晚可查驗一名玩家是否為狼人（『私訊』：查驗 名字，每晚一次）。",
-    "醫生": "夜晚可救一名玩家（『私訊』：救 名字，每晚一次；自救全局僅一次；不得連續兩晚救同一人）。",
-    "女巫": "擁有解藥與毒藥各一次（『私訊』：解救／投毒 名字）。「解救」只能救當晚狼刀對象，且**不得自救**。",
-    "獵人": "被淘汰後可『私訊』：開槍 名字（帶走一人，一次）。",
+    "狼人": "狼人｜夜晚可商議並擊殺一名玩家（『私訊』：擊殺 名字）。",
+    "村民": "村民｜無主動技能，靠發言與投票。",
+    "預言家": "預言家｜夜晚可查驗一名玩家是否為狼人（『私訊』：查驗 名字，每晚一次）。",
+    "醫生": "醫生｜夜晚可救一名玩家（『私訊』：救 名字；自救全局僅一次；不得連續兩晚救同一人）。",
+    "女巫": "女巫｜擁有解藥與毒藥各一次（『私訊』：解救／投毒 名字）。解救僅能救當晚狼刀對象，且不得自救。",
+    "獵人": "獵人｜被淘汰後可『私訊』：開槍 名字（帶走一人，一次）。",
 }
 
 class Player:
@@ -104,56 +162,43 @@ class GameRoom:
         self.host_id = host_id
         self.players: dict[str, Player] = {}
         self.started: bool = False
-        # waiting → config（模板與換角）→ night → day
-        self.phase: str = "waiting"
+        self.phase: str = "waiting"  # waiting → config → night → day
 
-        # 角色模板與調整後結果
         self.base_roles: list[str] = []
         self.current_roles: list[str] = []
 
-        # 白天投票
         self.votes: dict[str, str] = {}
-
-        # 夜晚：狼人刀票（收集投票，天亮時表決）
         self.wolf_targets: list[str] = []
 
-        # 夜晚行動狀態（晚上結算後會重置「每晚」欄位）
         self.night_flags = {
             # 預言家
-            "seer_done_uids": set(),            # 已查驗的預言家（每晚）
+            "seer_done_uids": set(),
             # 醫生
-            "doctor_saved_uid": None,           # 醫生本晚救的人（每晚）
-            "doctor_selfheal_used": set(),      # 醫生自救已用（全局）
-            "doctor_last_saved_uid": None,      # 上一晚醫生救的人（跨晚）
+            "doctor_saved_uid": None,
+            "doctor_selfheal_used": set(),
+            "doctor_last_saved_uid": None,
             # 女巫
-            "witch_heal_left": True,            # 女巫解藥剩餘（全局）
-            "witch_poison_left": True,          # 女巫毒藥剩餘（全局）
-            "witch_save_flag": False,           # 女巫本晚是否使用解藥（每晚）
-            "witch_poison_uid": None,           # 女巫本晚毒的人（每晚）
-            "witch_uid": None,                  # 本局女巫的 user_id（指派後填）
+            "witch_heal_left": True,
+            "witch_poison_left": True,
+            "witch_save_flag": False,
+            "witch_poison_uid": None,
+            "witch_uid": None,
         }
 
-        # 獵人待開槍
         self.hunter_pending_uid: str | None = None
 
-        # 自動結算
+        # 自動結算相關
         self.deadline_at = None
-        self.n_job_id = None    # 夜晚 job id
-        self.d_job_id = None    # 白天 job id
+        self.n_job_id = None
+        self.d_job_id = None
 
     def alive_players(self):
         return [p for p in self.players.values() if p.alive]
 
 ROOMS: dict[str, GameRoom] = {}
 
-# ================== 模板與換角 ==================
+# ============== 角色模板與換角 ==============
 def build_base_roles(n: int) -> list[str]:
-    """
-    5人：1 狼、1 預言家、1 醫生、2 村民
-    6人：2 狼、1 預言家、1 醫生、2 村民
-    7人：2 狼、1 預言家、1 醫生、3 村民
-    8人：2 狼、1 預言家、1 醫生、4 村民
-    """
     wolves = WOLF_COUNT_BY_N.get(n, max(1, n // 4))
     roles = ["狼人"] * wolves + ["預言家", "醫生"]
     while len(roles) < n:
@@ -190,11 +235,11 @@ def swap_villager_to_hunter(roles: list[str]) -> tuple[bool, str]:
     roles[idx] = "獵人"
     return True, "已將一名『村民』替換為『獵人』。"
 
-# ================== 共用邏輯 ==================
 def role_intro_text() -> str:
     lines = ["📚 角色清單（名稱｜能力）"]
-    for k, v in ROLE_DESCRIPTIONS.items():
-        lines.append(f"{v}")
+    for k in ["狼人", "預言家", "醫生", "女巫", "獵人", "村民"]:
+        if k in ROLE_DESCRIPTIONS:
+            lines.append(ROLE_DESCRIPTIONS[k])
     return "\n".join(lines)
 
 def assign_and_notify(room: GameRoom, roles: list[str]):
@@ -242,12 +287,47 @@ def ensure_in_room(uid: str) -> GameRoom | None:
             return r
     return None
 
-# ================== 自動結算：排程 ==================
+# ============== 簡易排程器（無 APScheduler 時用） ==============
+class SimpleScheduler:
+    def __init__(self):
+        self._jobs = {}
+
+    def add_job(self, func, trigger, run_date, args, id, replace_existing=True):
+        delay = max(0, (run_date - now_utc()).total_seconds())
+        t = threading.Timer(delay, func, args=args)
+        if replace_existing and id in self._jobs:
+            try:
+                self._jobs[id].cancel()
+            except Exception:
+                pass
+        self._jobs[id] = t
+        t.daemon = True
+        t.start()
+        return type("Job", (), {"id": id})
+
+    def remove_job(self, id):
+        t = self._jobs.pop(id, None)
+        if t:
+            t.cancel()
+
+# 建立 scheduler
+if USE_APS:
+    try:
+        scheduler = BackgroundScheduler()
+        scheduler.start()
+    except Exception as e:
+        print(f"[BOOT] APScheduler 啟動失敗，改用 SimpleScheduler：{e}")
+        USE_APS = False
+        scheduler = SimpleScheduler()
+else:
+    scheduler = SimpleScheduler()
+
+# ============== 自動結算（夜/日） ==============
 def schedule_night_timeout(room: GameRoom, minutes=None):
     minutes = minutes or NIGHT_MINUTES
     if room.n_job_id:
         try: scheduler.remove_job(room.n_job_id)
-        except: pass
+        except Exception: pass
     room.deadline_at = now_utc() + timedelta(minutes=minutes)
     job = scheduler.add_job(
         func=night_timeout_job,
@@ -264,7 +344,7 @@ def schedule_day_timeout(room: GameRoom, minutes=None):
     minutes = minutes or DAY_MINUTES
     if room.d_job_id:
         try: scheduler.remove_job(room.d_job_id)
-        except: pass
+        except Exception: pass
     room.deadline_at = now_utc() + timedelta(minutes=minutes)
     job = scheduler.add_job(
         func=day_timeout_job,
@@ -281,7 +361,7 @@ def clear_schedules(room: GameRoom):
     for jid in (room.n_job_id, room.d_job_id):
         if jid:
             try: scheduler.remove_job(jid)
-            except: pass
+            except Exception: pass
     room.n_job_id = room.d_job_id = None
     room.deadline_at = None
 
@@ -297,7 +377,6 @@ def day_timeout_job(room_id: str):
     room = ROOMS.get(room_id)
     if not room or room.phase != "day":
         return
-    # 自動白天結算
     auto_endday(room)
     if room and room.phase == "night":
         schedule_night_timeout(room)
@@ -318,19 +397,19 @@ def force_settle(room: GameRoom):
         if room and room.phase == "night":
             schedule_night_timeout(room)
 
-# ================== 指令（中文） ==================
+# ============== 指令（中文） ==============
 def cmd_help(event):
     reply_text(event,
         "📜 指令列表（中文）\n"
-        f"・建房／加入／狀態／角色清單／重置\n"
-        "・開始 → 產生『預設模板』 → 房主可『換 女巫 / 換 獵人』 → 『確認角色』發牌\n"
+        "・建房／加入／狀態／角色清單／重置\n"
+        "・開始 → 產生預設模板 → 房主可『換 女巫 / 換 獵人』 → 『確認角色』發牌\n"
         "・夜晚（請私訊機器人）：\n"
         "   狼人：擊殺 名字\n"
         "   預言家：查驗 名字（每晚一次）\n"
         "   醫生：救 名字（每晚一次；自救全局一次；不得連續兩晚救同一人）\n"
-        "   女巫：解救（只能救當晚刀口、且不得自救；一次）／投毒 名字（一次）\n"
+        "   女巫：解救（只能救當晚刀口且不得自救；一次）／投毒 名字（一次）\n"
         "・白天：投票 名字 → 結算（放逐最高票）\n"
-        "・自動結算：夜/日各有倒數，到時自動結算；房主可輸入『延長 分鐘數』或『立即結算』"
+        "・自動結算：夜/日皆有倒數；可『延長 分鐘數』或『立即結算』"
     )
 
 def cmd_rolelist(event):
@@ -434,16 +513,13 @@ def cmd_confirm_roles(event):
         reply_text(event, "角色數與玩家數不符，請確認後再試。")
         return
 
-    # 發牌 & 進夜晚
     room.started = True
     room.phase = "night"
-    # 重置每晚旗標
     room.wolf_targets = []
     room.night_flags["seer_done_uids"] = set()
     room.night_flags["doctor_saved_uid"] = None
     room.night_flags["witch_save_flag"] = False
     room.night_flags["witch_poison_uid"] = None
-    # 女巫/醫生跨晚限制保留：doctor_selfheal_used, doctor_last_saved_uid, witch_xxx_left
 
     assign_and_notify(room, room.current_roles.copy())
     reply_text(event,
@@ -513,9 +589,8 @@ def cmd_force(event):
         reply_text(event, "僅房主可立即結算。")
         return
     force_settle(room)
-    # 後續訊息在各結算函式內會自動發布
 
-# ================== 夜晚：私訊技能 ==================
+# ============== 夜晚私訊技能 ==============
 def pm_kill(uid: str, text: str):
     room = ensure_in_room(uid)
     if not room or not room.started or room.phase != "night":
@@ -560,7 +635,7 @@ def pm_seer(uid: str, text: str):
         return
     room.night_flags["seer_done_uids"].add(uid)
     result = "狼人" if cands[0].role == "狼人" else "非狼人"
-    push_text(uid, f"查驗結果：{target_name} 是")
+    push_text(uid, f"查驗結果：{target_name} 是 {result}")
 
 def pm_doctor(uid: str, text: str):
     room = ensure_in_room(uid)
@@ -585,7 +660,7 @@ def pm_doctor(uid: str, text: str):
     if room.night_flags["doctor_last_saved_uid"] == target.user_id:
         push_text(uid, "不得連續兩晚救同一人。")
         return
-    # 自救全局僅一次
+    # 自救全局一次
     if target.user_id == uid and uid in room.night_flags["doctor_selfheal_used"]:
         push_text(uid, "你的自救次數已用完。")
         return
@@ -606,7 +681,7 @@ def pm_witch_heal(uid: str):
     if not room.night_flags["witch_heal_left"]:
         push_text(uid, "你的解藥已用完。")
         return
-    # 不直接指定對象；僅標記本晚使用。實際救誰在結算時計算狼刀目標。
+    # 只標記本晚用了解藥；實際救誰在結算時計算狼刀目標
     room.night_flags["witch_save_flag"] = True
     push_text(uid, "已使用『解救』（僅對當晚刀口生效，且不得自救）。")
 
@@ -657,7 +732,7 @@ def pm_hunter_shoot(uid: str, text: str):
     if check_game_end(room):
         return
 
-# ================== 夜晚結算 → 白天 ==================
+# ============== 夜晚結算 → 白天 ==============
 def resolve_night_and_start_day(room: GameRoom, event=None):
     # 1) 狼人票選刀口
     wolf_target_uid = None
@@ -671,16 +746,15 @@ def resolve_night_and_start_day(room: GameRoom, event=None):
     if room.night_flags["doctor_saved_uid"] == wolf_target_uid:
         wolf_target_uid = None  # 被救
 
-    # 3) 女巫解藥（僅能救當晚刀口，且不得自救）
+    # 3) 女巫解藥（僅救當晚刀口；不得自救）
     if room.night_flags["witch_save_flag"] and room.night_flags["witch_heal_left"]:
         if wolf_target_uid is not None:
-            # 不得自救：若刀口就是女巫本人，則解藥無效
             witch_uid = room.night_flags["witch_uid"]
             if wolf_target_uid != witch_uid:
                 wolf_target_uid = None
                 room.night_flags["witch_heal_left"] = False
 
-    # 4) 女巫毒藥（與解藥獨立生效；可毒任意活人）
+    # 4) 女巫毒藥
     poison_uid = None
     if room.night_flags["witch_poison_uid"] and room.night_flags["witch_poison_left"]:
         poison_uid = room.night_flags["witch_poison_uid"]
@@ -713,10 +787,9 @@ def resolve_night_and_start_day(room: GameRoom, event=None):
     if event: reply_text(event, msg)
     else: push_text(room.room_id, msg)
 
-    # 清空當晚狀態（保留跨晚限制）
+    # 清空當晚狀態
     room.wolf_targets = []
     room.night_flags["seer_done_uids"] = set()
-    # 記錄「上一晚醫生救的人」用於「不得連救同一人」
     room.night_flags["doctor_last_saved_uid"] = room.night_flags["doctor_saved_uid"]
     room.night_flags["doctor_saved_uid"] = None
     room.night_flags["witch_save_flag"] = False
@@ -726,16 +799,15 @@ def resolve_night_and_start_day(room: GameRoom, event=None):
     if check_game_end(room, event):
         return
 
-    # 進入白天並啟動倒數
+    # 進入白天＋倒數
     room.phase = "day"
     schedule_day_timeout(room)
     tip = "請討論並『投票 名字』，時間到自動『結算』放逐最高票。"
     if event: reply_text(event, tip)
     else: push_text(room.room_id, tip)
 
-# ================== 白天流程（手動與自動共用） ==================
+# ============== 白天：投票與結算 ==============
 def auto_endday(room: GameRoom):
-    """自動版白天結算（與手動邏輯一致）。"""
     if not room.votes:
         push_text(room.room_id, "⌛ 白天時間到：今天無人投票，進入夜晚。")
         room.phase = "night"
@@ -789,81 +861,69 @@ def cmd_endday(event):
     if room.phase != "day":
         reply_text(event, "現在不是白天結算階段。")
         return
-    # 手動結算
     auto_endday(room)
 
-# ================== 路由 ==================
-@app.route("/")
-def index():
-    return "Werewolf LINE Bot：/callback", 200
+# ============== 事件處理 ==============
+if LINE_READY:
+    @handler.add(MessageEvent, message=TextMessageContent)
+    def on_message(event: MessageEvent):
+        text = (event.message.text or "").strip()
 
-@app.route("/callback", methods=["POST"])
-def callback():
-    sig = request.headers.get("X-Line-Signature", "")
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, sig)
-    except InvalidSignatureError:
-        abort(400)
-    return "OK"
+        # 私訊技能
+        if text.startswith("擊殺"):
+            pm_kill(get_user_id(event), text); return
+        if text.startswith("查驗"):
+            pm_seer(get_user_id(event), text); return
+        if text.startswith("救"):
+            pm_doctor(get_user_id(event), text); return
+        if text == "解救":
+            pm_witch_heal(get_user_id(event)); return
+        if text.startswith("投毒"):
+            pm_witch_poison(get_user_id(event), text); return
+        if text.startswith("開槍"):
+            pm_hunter_shoot(get_user_id(event), text); return
 
-# ================== 事件處理 ==================
-@handler.add(MessageEvent, message=TextMessageContent)
-def on_message(event: MessageEvent):
-    text = (event.message.text or "").strip()
+        # 群組/私訊中文指令
+        if text == "幫助": cmd_help(event); return
+        if text == "角色清單": cmd_rolelist(event); return
+        if text == "建房": cmd_build(event); return
+        if text == "加入": cmd_join(event); return
+        if text == "狀態": cmd_status(event); return
+        if text == "重置": cmd_reset(event); return
 
-    # ==== 私訊技能 ====
-    if text.startswith("擊殺"):
-        pm_kill(get_user_id(event), text); return
-    if text.startswith("查驗"):
-        pm_seer(get_user_id(event), text); return
-    if text.startswith("救"):
-        pm_doctor(get_user_id(event), text); return
-    if text == "解救":
-        pm_witch_heal(get_user_id(event)); return
-    if text.startswith("投毒"):
-        pm_witch_poison(get_user_id(event), text); return
-    if text.startswith("開槍"):
-        pm_hunter_shoot(get_user_id(event), text); return
+        if text == "開始": cmd_start(event); return
+        if text == "確認角色": cmd_confirm_roles(event); return
+        if text.startswith("換"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 2:
+                cmd_swap(event, parts[1].strip())
+            else:
+                reply_text(event, "用法：換 女巫／換 獵人")
+            return
 
-    # ==== 群組/私訊中文指令 ====
-    if text == "幫助": cmd_help(event); return
-    if text == "角色清單": cmd_rolelist(event); return
-    if text == "建房": cmd_build(event); return
-    if text == "加入": cmd_join(event); return
-    if text == "狀態": cmd_status(event); return
-    if text == "重置": cmd_reset(event); return
+        if text.startswith("投票"):
+            parts = text.split(maxsplit=1)
+            if len(parts) == 2: cmd_vote(event, parts[1].strip())
+            else: reply_text(event, "用法：投票 名字（例：投票 小明）")
+            return
 
-    if text == "開始": cmd_start(event); return
-    if text == "確認角色": cmd_confirm_roles(event); return
-    if text.startswith("換"):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            cmd_swap(event, parts[1].strip())
-        else:
-            reply_text(event, "用法：換 女巫／換 獵人")
+        if text == "結算":
+            cmd_endday(event); return
+
+        # 房主工具
+        if text.startswith("延長"):
+            parts = text.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                cmd_extend(event, int(parts[1])); return
+            reply_text(event, "用法：延長 分鐘數（例：延長 2）"); return
+
+        if text == "立即結算":
+            cmd_force(event); return
+
+        # 默認不回覆，避免干擾群聊
         return
 
-    if text.startswith("投票"):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2: cmd_vote(event, parts[1].strip())
-        else: reply_text(event, "用法：投票 名字（例：投票 小明）")
-        return
-    if text == "結算":
-        cmd_endday(event); return
-
-    # 房主工具
-    if text.startswith("延長"):
-        parts = text.split()
-        if len(parts) == 2 and parts[1].isdigit():
-            cmd_extend(event, int(parts[1])); return
-        reply_text(event, "用法：延長 分鐘數（例：延長 2）"); return
-    if text == "立即結算":
-        cmd_force(event); return
-
-    # 默認不回覆，避免干擾群聊
-    return
-
+# ============== 本機測試入口 ==============
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=True)
